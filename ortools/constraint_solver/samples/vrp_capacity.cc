@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
@@ -5,14 +6,13 @@
 #include <string>
 #include <vector>
 
+#include "absl/flags/parse.h"
 #include "google/protobuf/duration.pb.h"
 #include "ortools/constraint_solver/routing.h"
 #include "ortools/constraint_solver/routing_enums.pb.h"
 #include "ortools/constraint_solver/routing_index_manager.h"
 #include "ortools/constraint_solver/routing_parameters.h"
-
 #include "util/json.hpp"
-#include "absl/flags/parse.h"
 
 using json = nlohmann::json;
 
@@ -56,8 +56,8 @@ DataModel loadDataFromJson() {
     data.num_vehicles = j["num_vehicles"].get<int>();
     data.depot = j["depot"].get<int>();
     data.vehicle_distance_limit = j["vehicle_distances"].get<int64_t>();
-    
-    //std::cout << fileContent;
+
+    // std::cout << fileContent;
 
   } else {
     std::cerr << "Error opening file for reading.\n";
@@ -68,34 +68,56 @@ DataModel loadDataFromJson() {
 
 void PrintSolution(const DataModel& data, const RoutingIndexManager& manager,
                    const RoutingModel& routing, const Assignment& solution) {
-  int64_t total_distance = 0;
+  json results = {{"max_route_distance", 0}, {"routes", json::array()}};
+  int64_t max_route_distance = 0;
   int64_t total_load = 0;
+  std::string filePath = absl::GetFlag(FLAGS_input_filepath);
+  size_t start_pos = filePath.find("in");
+  filePath = filePath.replace(start_pos, 2, "out");
+
   for (int vehicle_id = 0; vehicle_id < data.num_vehicles; ++vehicle_id) {
-    int64_t index = routing.Start(vehicle_id);
-    LOG(INFO) << "Route for Vehicle " << vehicle_id << ":";
+
+    int index = routing.Start(vehicle_id);
+    std::vector<int64_t> plan_output;
     int64_t route_distance = 0;
-    int64_t route_load = 0;
-    std::stringstream route;
-    while (!routing.IsEnd(index)) {
-      const int node_index = manager.IndexToNode(index).value();
-      route_load += data.demands[node_index];
-      route << node_index << " Load(" << route_load << ") -> ";
-      const int64_t previous_index = index;
-      index = solution.Value(routing.NextVar(index));
-      route_distance += routing.GetArcCostForVehicle(previous_index, index,
-                                                     int64_t{vehicle_id});
+    int route_load = 0;
+    int current_index = manager.IndexToNode(index).value();
+
+    while (!routing.IsEnd(current_index)) {
+
+      plan_output.push_back(current_index);
+      int next_index = solution.Value(routing.NextVar(current_index));
+      route_distance +=
+          routing.GetArcCostForVehicle(current_index, next_index, vehicle_id);
+      route_load += data.demands[current_index];
+      current_index = next_index;
     }
-    LOG(INFO) << route.str() << manager.IndexToNode(index).value();
-    LOG(INFO) << "Distance of the route: " << route_distance << "m";
-    LOG(INFO) << "Load of the route: " << route_load;
-    total_distance += route_distance;
-    total_load += route_load;
+
+    plan_output.push_back(manager.IndexToNode(index).value());
+
+    json route_info = {{"routes", plan_output},
+                       {"vehicle_id", vehicle_id},
+                       {"distance", route_distance},
+                       {"load", route_load}};
+
+    results["routes"].insert(results["routes"].begin() + vehicle_id,
+                             route_info);
+
+    max_route_distance = std::max(route_distance, max_route_distance);
   }
-  LOG(INFO) << "Total distance of all routes: " << total_distance << "m";
-  LOG(INFO) << "Total load of all routes: " << total_load;
-  LOG(INFO) << "";
-  LOG(INFO) << "Advanced usage:";
-  LOG(INFO) << "Problem solved in " << routing.solver()->wall_time() << "ms";
+
+  results["max_route_distance"] = max_route_distance;
+  results["calculation_time"] = routing.solver()->wall_time();
+
+  std::ofstream file(filePath);
+  if (file.is_open()) {
+    file << results.dump(4);  // 4-space indentation for pretty printing
+    file.close();
+    std::cout << "Solution saved to " << filePath << std::endl;
+  } else {
+    std::cerr << "Error opening file " << filePath << " for writing."
+              << std::endl;
+  }
 }
 
 void VrpCapacity() {
@@ -140,7 +162,7 @@ void VrpCapacity() {
   search_parameters.set_local_search_metaheuristic(
       LocalSearchMetaheuristic::AUTOMATIC);
   search_parameters.mutable_time_limit()->set_seconds(1);
-  search_parameters.set_log_search(true);
+  //search_parameters.set_log_search(true);
 
   const Assignment* solution = routing.SolveWithParameters(search_parameters);
 
@@ -158,4 +180,4 @@ int main(int argc, char* argv[]) {
   operations_research::VrpCapacity();
   return EXIT_SUCCESS;
 }
-// [END program]
+
