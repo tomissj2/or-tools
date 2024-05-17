@@ -29,6 +29,7 @@ struct DataModel {
   std::vector<int64_t> demands{};
   std::vector<int64_t> vehicle_capacities{};
   int num_vehicles;
+  int calculation_id;
   RoutingIndexManager::NodeIndex depot{};
   int64_t vehicle_distance_limit;
 };
@@ -54,6 +55,7 @@ DataModel loadDataFromJson() {
     data.vehicle_capacities =
         j["vehicle_capacities"].get<std::vector<int64_t>>();
     data.num_vehicles = j["num_vehicles"].get<int>();
+    data.calculation_id = j["calculation_id"].get<int>();
     data.depot = j["depot"].get<int>();
     data.vehicle_distance_limit = j["vehicle_distances"].get<int64_t>();
 
@@ -69,14 +71,14 @@ DataModel loadDataFromJson() {
 void PrintSolution(const DataModel& data, const RoutingIndexManager& manager,
                    const RoutingModel& routing, const Assignment& solution) {
   json results = {{"max_route_distance", 0}, {"routes", json::array()}};
+
   int64_t max_route_distance = 0;
   int64_t total_load = 0;
   std::string filePath = absl::GetFlag(FLAGS_input_filepath);
-  size_t start_pos = filePath.find("in");
-  filePath = filePath.replace(start_pos, 2, "out");
+  size_t start_pos = filePath.find(".json");
+  filePath = filePath.replace(start_pos, 2, "_out.json");
 
   for (int vehicle_id = 0; vehicle_id < data.num_vehicles; ++vehicle_id) {
-
     int index = routing.Start(vehicle_id);
     std::vector<int64_t> plan_output;
     int64_t route_distance = 0;
@@ -84,7 +86,6 @@ void PrintSolution(const DataModel& data, const RoutingIndexManager& manager,
     int current_index = manager.IndexToNode(index).value();
 
     while (!routing.IsEnd(current_index)) {
-
       plan_output.push_back(current_index);
       int next_index = solution.Value(routing.NextVar(current_index));
       route_distance +=
@@ -109,9 +110,12 @@ void PrintSolution(const DataModel& data, const RoutingIndexManager& manager,
   results["max_route_distance"] = max_route_distance;
   results["calculation_time"] = routing.solver()->wall_time();
 
+  json return_json = {{"result", results},
+                      {"calculation_id", data.calculation_id}};
+
   std::ofstream file(filePath);
   if (file.is_open()) {
-    file << results.dump(4);  // 4-space indentation for pretty printing
+    file << return_json.dump(4);  // 4-space indentation for pretty printing
     file.close();
     std::cout << "Solution saved to " << filePath << std::endl;
   } else {
@@ -162,7 +166,7 @@ void VrpCapacity() {
   search_parameters.set_local_search_metaheuristic(
       LocalSearchMetaheuristic::AUTOMATIC);
   search_parameters.mutable_time_limit()->set_seconds(1);
-  //search_parameters.set_log_search(true);
+  // search_parameters.set_log_search(true);
 
   const Assignment* solution = routing.SolveWithParameters(search_parameters);
 
@@ -180,4 +184,3 @@ int main(int argc, char* argv[]) {
   operations_research::VrpCapacity();
   return EXIT_SUCCESS;
 }
-
