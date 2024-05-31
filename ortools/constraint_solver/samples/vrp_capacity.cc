@@ -36,6 +36,8 @@ struct DataModel {
 
 DataModel loadDataFromJson() {
   std::string filePath = absl::GetFlag(FLAGS_input_filepath);
+  std::cout << "Data loaded from: " << filePath << std::endl;
+
   std::string fileContent;
   std::ifstream inFile(filePath);
 
@@ -48,21 +50,21 @@ DataModel loadDataFromJson() {
     inFile.close();
 
     json j = json::parse(fileContent);
-
+    auto indata = j["datas"];
     data.distance_matrix =
-        j["distance_matrix"].get<std::vector<std::vector<int64_t>>>();
-    data.demands = j["demands"].get<std::vector<int64_t>>();
+        indata["distance_matrix"].get<std::vector<std::vector<int64_t>>>();
+    data.demands = indata["demands"].get<std::vector<int64_t>>();
     data.vehicle_capacities =
-        j["vehicle_capacities"].get<std::vector<int64_t>>();
-    data.num_vehicles = j["num_vehicles"].get<int>();
-    data.calculation_id = j["calculation_id"].get<int>();
-    data.depot = j["depot"].get<int>();
-    data.vehicle_distance_limit = j["vehicle_distances"].get<int64_t>();
+        indata["vehicle_capacities"].get<std::vector<int64_t>>();
+    data.num_vehicles = indata["num_vehicles"].get<int>();
+    data.calculation_id = indata["calculation_id"].get<int>();
+    data.depot = indata["depot"].get<int>();
+    data.vehicle_distance_limit = indata["vehicle_distances"].get<int64_t>();
 
     // std::cout << fileContent;
 
   } else {
-    std::cerr << "Error opening file for reading.\n";
+    std::cerr << "Error opening file for readin: " + filePath + "\n";
   }
 
   return data;
@@ -76,7 +78,7 @@ void PrintSolution(const DataModel& data, const RoutingIndexManager& manager,
   int64_t total_load = 0;
   std::string filePath = absl::GetFlag(FLAGS_input_filepath);
   size_t start_pos = filePath.find(".json");
-  filePath = filePath.replace(start_pos, 2, "_out.json");
+  filePath = filePath.replace(start_pos, 5, "_out.json");
 
   for (int vehicle_id = 0; vehicle_id < data.num_vehicles; ++vehicle_id) {
     int index = routing.Start(vehicle_id);
@@ -117,7 +119,8 @@ void PrintSolution(const DataModel& data, const RoutingIndexManager& manager,
   if (file.is_open()) {
     file << return_json.dump(4);  // 4-space indentation for pretty printing
     file.close();
-    std::cout << "Solution saved to " << filePath << std::endl;
+
+    std::cout << "Data saved to:    " << filePath << std::endl;
   } else {
     std::cerr << "Error opening file " << filePath << " for writing."
               << std::endl;
