@@ -1,181 +1,308 @@
-// Copyright 2010-2024 Google LLC
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
-//
-// Capacitated Vehicle Routing Problem with Time Windows (and optional orders).
-// A description of the problem can be found here:
-// http://en.wikipedia.org/wiki/Vehicle_routing_problem.
-// The variant which is tackled by this model includes a capacity dimension,
-// time windows and optional orders, with a penalty cost if orders are not
-// performed. For the sake of simplicity, orders are randomly located and
-// distances are computed using the Manhattan distance. Distances are assumed
-// to be in meters and times in seconds.
-
 #include <cstdint>
+#include <fstream>
 #include <vector>
 
-#include "absl/random/random.h"
-#include "examples/cpp/cvrptw_lib.h"
 #include "google/protobuf/text_format.h"
 #include "ortools/base/commandlineflags.h"
 #include "ortools/base/init_google.h"
-#include "ortools/base/types.h"
 #include "ortools/base/logging.h"
+#include "ortools/base/types.h"
 #include "ortools/constraint_solver/routing.h"
+#include "ortools/constraint_solver/routing_enums.pb.h"
 #include "ortools/constraint_solver/routing_index_manager.h"
 #include "ortools/constraint_solver/routing_parameters.h"
 #include "ortools/constraint_solver/routing_parameters.pb.h"
+#include "util/json.hpp"
+
+using json = nlohmann::json;
+
+ABSL_FLAG(std::string, input_filepath, "example.json",
+          "Input file that contains the data to process");
 
 using operations_research::Assignment;
 using operations_research::DefaultRoutingSearchParameters;
-using operations_research::GetSeed;
-using operations_research::LocationContainer;
-using operations_research::RandomDemand;
 using operations_research::RoutingDimension;
 using operations_research::RoutingIndexManager;
 using operations_research::RoutingModel;
 using operations_research::RoutingNodeIndex;
 using operations_research::RoutingSearchParameters;
-using operations_research::ServiceTimePlusTransition;
 
-ABSL_FLAG(int, vrp_orders, 100, "Number of nodes in the problem");
-ABSL_FLAG(int, vrp_vehicles, 20, "Number of vehicles in the problem");
-ABSL_FLAG(bool, vrp_use_deterministic_random_seed, false,
-          "Use deterministic random seeds");
-ABSL_FLAG(bool, vrp_use_same_vehicle_costs, false,
-          "Use same vehicle costs in the routing model");
-ABSL_FLAG(std::string, routing_search_parameters, "",
-          "Text proto RoutingSearchParameters (possibly partial) that will "
-          "override the DefaultRoutingSearchParameters()");
-
+// ABSL_FLAG(std::string, input_filepath, "example.json",
+//           "Input file that contains the data to process");
 const char* kTime = "Time";
 const char* kCapacity = "Capacity";
+const auto* kDistance = "Distance";
+
 const int64_t kMaxNodesPerGroup = 10;
 const int64_t kSameVehicleCost = 1000;
 
+struct DataModel {
+  std::vector<std::vector<int64_t>> distance_matrix{};
+  std::vector<std::vector<int64_t>> time_matrix;
+  std::vector<int64_t> demands{};
+  std::vector<int64_t> vehicle_capacities{};
+  std::vector<std::vector<int64_t>> time_windows;
+  int num_vehicles;
+  int calculation_id;
+  RoutingIndexManager::NodeIndex depot{};
+  int64_t vehicle_distance_limit;
+  int64_t vehicleWaitTime;
+};
+
+DataModel loadDataFromJson() {
+  std::string filePath = absl::GetFlag(FLAGS_input_filepath);
+
+  std::string fileContent;
+  std::ifstream inFile(filePath);
+
+  DataModel data;
+
+  if (inFile.is_open()) {
+    std::stringstream buffer;
+    buffer << inFile.rdbuf();
+    fileContent = buffer.str();
+    inFile.close();
+
+    json j = json::parse(fileContent);
+    std::cout << "Data loaded from: " << filePath << std::endl;
+    auto indata = j["datas"];
+    data.distance_matrix =
+        indata["distance_matrix"].get<std::vector<std::vector<int64_t>>>();
+
+    data.demands = indata["demands"].get<std::vector<int64_t>>();
+    data.vehicle_capacities =
+        indata["vehicle_capacities"].get<std::vector<int64_t>>();
+    data.num_vehicles = indata["num_vehicles"].get<int>();
+    data.calculation_id = indata["calculation_id"].get<int>();
+    data.depot = indata["depot"].get<int>();
+    data.vehicle_distance_limit = indata["vehicle_distances"].get<int64_t>();
+
+    data.time_matrix =
+        indata["time_matrix"].get<std::vector<std::vector<int64_t>>>();
+    data.time_windows =
+        indata["time_windows"].get<std::vector<std::vector<int64_t>>>();
+    // std::cout << fileContent;
+
+  } else {
+    std::cerr << "Error opening file for readin: " + filePath + "\n";
+  }
+
+  return data;
+}
+
+void SaveSolution(const DataModel& data, const RoutingIndexManager& manager,
+                  const RoutingModel& routing, const Assignment& solution) {
+  json results = {{"max_route_distance", 0}, {"routes", json::array()}};
+
+  int64_t max_route_distance = 0;
+  int64_t total_load = 0;
+  std::string filePath = absl::GetFlag(FLAGS_input_filepath);
+  size_t start_pos = filePath.find(".json");
+  filePath = filePath.replace(start_pos, 5, "_out.json");
+
+  const RoutingDimension& time_dimension = routing.GetDimensionOrDie(kTime);
+  int64_t total_time{0};
+
+  for (int vehicle_id = 0; vehicle_id < data.num_vehicles; ++vehicle_id) {
+    int index = routing.Start(vehicle_id);
+
+    std::vector<std::vector<int64_t>> time_planOutput;
+    std::vector<int64_t> plan_output;
+    int64_t route_distance = 0;
+    int route_load = 0;
+
+    while (!routing.IsEnd(index)) {
+      auto time_var = time_dimension.CumulVar(index);
+      std::vector<int64_t> time_data;
+      time_data.push_back(manager.IndexToNode(index).value());
+      time_data.push_back(solution.Min(time_var));
+      time_data.push_back(solution.Max(time_var));
+      time_planOutput.push_back(time_data);
+
+      plan_output.push_back(manager.IndexToNode(index).value());
+      int next_index = solution.Value(routing.NextVar(index));
+      route_distance +=
+          routing.GetArcCostForVehicle(index, next_index, vehicle_id);
+      route_load += data.demands[manager.IndexToNode(index).value()];
+
+      index = solution.Value(routing.NextVar(index));
+    }
+    plan_output.push_back(manager.IndexToNode(index).value());
+
+    auto time_var = time_dimension.CumulVar(index);
+    std::vector<int64_t> time_data;
+    time_data.push_back(manager.IndexToNode(index).value());
+    time_data.push_back(solution.Min(time_var));
+    time_data.push_back(solution.Max(time_var));
+    time_planOutput.push_back(time_data);
+
+    auto route_time = solution.Min(time_var);
+
+    json route_info = {{"vehicle_id", vehicle_id},   {"routes", plan_output},
+                       {"times", time_planOutput},   {"route_time", route_time},
+                       {"distance", route_distance}, {"load", route_load}};
+
+    results["routes"].insert(results["routes"].begin() + vehicle_id,
+                             route_info);
+
+    max_route_distance = std::max(route_distance, max_route_distance);
+  }
+
+  results["max_route_distance"] = max_route_distance;
+  results["calculation_time"] = routing.solver()->wall_time();
+
+  json return_json = {{"result", results},
+                      {"calculation_id", data.calculation_id}};
+
+  std::ofstream file(filePath);
+  if (file.is_open()) {
+    file << return_json.dump(4);  // 4-space indentation for pretty printing
+    file.close();
+
+    std::cout << "Data saved to:    " << filePath << std::endl;
+  } else {
+    std::cerr << "Error opening file " << filePath << " for writing."
+              << std::endl;
+  }
+}
+
+void PrintSolution(const DataModel& data, const RoutingIndexManager& manager,
+                   const RoutingModel& routing, const Assignment& solution) {
+  const RoutingDimension& time_dimension = routing.GetDimensionOrDie("Time");
+  int64_t total_time{0};
+  for (int vehicle_id = 0; vehicle_id < data.num_vehicles; ++vehicle_id) {
+    int64_t index = routing.Start(vehicle_id);
+    LOG(INFO) << "Route for vehicle " << vehicle_id << ":";
+    std::ostringstream route;
+    while (!routing.IsEnd(index)) {
+      auto time_var = time_dimension.CumulVar(index);
+      route << manager.IndexToNode(index).value() << " Time("
+            << solution.Min(time_var) << ", " << solution.Max(time_var)
+            << ") -> ";
+      index = solution.Value(routing.NextVar(index));
+    }
+    auto time_var = time_dimension.CumulVar(index);
+    LOG(INFO) << route.str() << manager.IndexToNode(index).value() << " Time("
+              << solution.Min(time_var) << ", " << solution.Max(time_var)
+              << ")";
+    LOG(INFO) << "Time of the route: " << solution.Min(time_var) << "min";
+    total_time += solution.Min(time_var);
+  }
+  LOG(INFO) << "Total time of all routes: " << total_time << "min";
+  LOG(INFO) << "";
+  LOG(INFO) << "Advanced usage:";
+  LOG(INFO) << "Problem solved in " << routing.solver()->wall_time() << "ms";
+}
+
 int main(int argc, char** argv) {
-  InitGoogle(argv[0], &argc, &argv, true);
-  CHECK_LT(0, absl::GetFlag(FLAGS_vrp_orders))
-      << "Specify an instance size greater than 0.";
-  CHECK_LT(0, absl::GetFlag(FLAGS_vrp_vehicles))
-      << "Specify a non-null vehicle fleet size.";
-  // VRP of size absl::GetFlag(FLAGS_vrp_size).
-  // Nodes are indexed from 0 to absl::GetFlag(FLAGS_vrp_orders), the starts and
-  // ends of the routes are at node 0.
-  const RoutingIndexManager::NodeIndex kDepot(0);
-  RoutingIndexManager manager(absl::GetFlag(FLAGS_vrp_orders) + 1,
-                              absl::GetFlag(FLAGS_vrp_vehicles), kDepot);
+  absl::ParseCommandLine(argc, argv);
+  DataModel data = loadDataFromJson();
+
+  RoutingIndexManager manager(data.distance_matrix.size(), data.num_vehicles,
+                              data.depot);
+
   RoutingModel routing(manager);
 
-  // Setting up locations.
-  const int64_t kXMax = 100000;
-  const int64_t kYMax = 100000;
-  const int64_t kSpeed = 10;
-  LocationContainer locations(
-      kSpeed, absl::GetFlag(FLAGS_vrp_use_deterministic_random_seed));
-  for (int location = 0; location <= absl::GetFlag(FLAGS_vrp_orders);
-       ++location) {
-    locations.AddRandomLocation(kXMax, kYMax);
-  }
-
-  // Setting the cost function.
+  std::cout << "1 ";
+  // Adding distance matrix
   const int vehicle_cost = routing.RegisterTransitCallback(
-      [&locations, &manager](int64_t i, int64_t j) {
-        return locations.ManhattanDistance(manager.IndexToNode(i),
-                                           manager.IndexToNode(j));
+      [&data, &manager](const int64_t from_index,
+                        const int64_t to_index) -> int64_t {
+        const int from_node = manager.IndexToNode(from_index).value();
+        const int to_node = manager.IndexToNode(to_index).value();
+        return data.distance_matrix[from_node][to_node];
       });
+
   routing.SetArcCostEvaluatorOfAllVehicles(vehicle_cost);
 
-  // Adding capacity dimension constraints.
-  const int64_t kVehicleCapacity = 40;
-  const int64_t kNullCapacitySlack = 0;
-  RandomDemand demand(manager.num_nodes(), kDepot,
-                      absl::GetFlag(FLAGS_vrp_use_deterministic_random_seed));
-  demand.Initialize();
-  routing.AddDimension(routing.RegisterTransitCallback(
-                           [&demand, &manager](int64_t i, int64_t j) {
-                             return demand.Demand(manager.IndexToNode(i),
-                                                  manager.IndexToNode(j));
-                           }),
-                       kNullCapacitySlack, kVehicleCapacity,
-                       /*fix_start_cumul_to_zero=*/true, kCapacity);
+  std::cout << "2 ";
+  // adding distance limit
+  routing.AddDimension(vehicle_cost, 0, data.vehicle_distance_limit, true,
+                       kDistance);
+  auto routing_dimension = routing.GetMutableDimension(kDistance);
+  routing_dimension->SetGlobalSpanCostCoefficient(100);
+
+  // adding vehicle capaties
+  const int demand_callback_index = routing.RegisterUnaryTransitCallback(
+      [&data, &manager](const int64_t from_index) -> int64_t {
+        const int from_node = manager.IndexToNode(from_index).value();
+        return data.demands[from_node];
+      });
+
+  std::cout << "3 ";
+  routing.AddDimensionWithVehicleCapacity(
+      demand_callback_index,    // transit callback index
+      int64_t{0},               // null capacity slack
+      data.vehicle_capacities,  // vehicle maximum capacities
+      true,                     // start cumul to zero
+      kCapacity);
 
   // Adding time dimension constraints.
-  const int64_t kTimePerDemandUnit = 300;
-  const int64_t kHorizon = 24 * 3600;
-  ServiceTimePlusTransition time(
-      kTimePerDemandUnit,
-      [&demand](RoutingNodeIndex i, RoutingNodeIndex j) {
-        return demand.Demand(i, j);
-      },
-      [&locations](RoutingNodeIndex i, RoutingNodeIndex j) {
-        return locations.ManhattanTime(i, j);
+  const int transit_callback_index = routing.RegisterTransitCallback(
+      [&data, &manager](const int64_t from_index,
+                        const int64_t to_index) -> int64_t {
+        // Convert from routing variable Index to time matrix NodeIndex.
+        const int from_node = manager.IndexToNode(from_index).value();
+        const int to_node = manager.IndexToNode(to_index).value();
+        return data.time_matrix[from_node][to_node];
       });
-  routing.AddDimension(
-      routing.RegisterTransitCallback([&time, &manager](int64_t i, int64_t j) {
-        return time.Compute(manager.IndexToNode(i), manager.IndexToNode(j));
-      }),
-      kHorizon, kHorizon, /*fix_start_cumul_to_zero=*/true, kTime);
+
+  std::cout << "4 ";
+  // Define cost of each arc.
+  routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index);
+
+  routing.AddDimension(transit_callback_index,  // transit callback index
+                       int64_t{30},             // allow waiting time
+                       int64_t{30},             // maximum time per vehicle
+                       false,  // Don't force start cumul to zero
+                       kTime);
   const RoutingDimension& time_dimension = routing.GetDimensionOrDie(kTime);
 
-  // Adding time windows.
-  std::mt19937 randomizer(
-      GetSeed(absl::GetFlag(FLAGS_vrp_use_deterministic_random_seed)));
-  const int64_t kTWDuration = 5 * 3600;
-  for (int order = 1; order < manager.num_nodes(); ++order) {
-    const int64_t start =
-        absl::Uniform<int32_t>(randomizer, 0, kHorizon - kTWDuration);
-    time_dimension.CumulVar(order)->SetRange(start, start + kTWDuration);
+  std::cout << "5 ";
+  // Add time window constraints for each location except depot.
+  for (int i = 1; i < data.time_windows.size(); ++i) {
+    const int64_t index =
+        manager.NodeToIndex(RoutingIndexManager::NodeIndex(i));
+    time_dimension.CumulVar(index)->SetRange(data.time_windows[i][0],
+                                             data.time_windows[i][1]);
+  }
+  // Add time window constraints for each vehicle start node.
+  for (int i = 0; i < data.num_vehicles; ++i) {
+    const int64_t index = routing.Start(i);
+    time_dimension.CumulVar(index)->SetRange(data.time_windows[0][0],
+                                             data.time_windows[0][1]);
   }
 
-  // Adding penalty costs to allow skipping orders.
-  const int64_t kPenalty = 10000000;
-  const RoutingIndexManager::NodeIndex kFirstNodeAfterDepot(1);
-  for (RoutingIndexManager::NodeIndex order = kFirstNodeAfterDepot;
-       order < manager.num_nodes(); ++order) {
-    std::vector<int64_t> orders(1, manager.NodeToIndex(order));
-    routing.AddDisjunction(orders, kPenalty);
+  std::cout << "6 ";
+  // Instantiate route start and end times to produce feasible times.
+  for (int i = 0; i < data.num_vehicles; ++i) {
+    routing.AddVariableMinimizedByFinalizer(
+        time_dimension.CumulVar(routing.Start(i)));
+    routing.AddVariableMinimizedByFinalizer(
+        time_dimension.CumulVar(routing.End(i)));
   }
 
-  // Adding same vehicle constraint costs for consecutive nodes.
-  if (absl::GetFlag(FLAGS_vrp_use_same_vehicle_costs)) {
-    std::vector<int64_t> group;
-    for (RoutingIndexManager::NodeIndex order = kFirstNodeAfterDepot;
-         order < manager.num_nodes(); ++order) {
-      group.push_back(manager.NodeToIndex(order));
-      if (group.size() == kMaxNodesPerGroup) {
-        routing.AddSoftSameVehicleConstraint(group, kSameVehicleCost);
-        group.clear();
-      }
-    }
-    if (!group.empty()) {
-      routing.AddSoftSameVehicleConstraint(group, kSameVehicleCost);
-    }
+  std::cout << "7 ";
+  for (int i = 1; i < data.time_windows.size(); ++i) {
+    const int64_t index =
+        manager.NodeToIndex(RoutingIndexManager::NodeIndex(i));
+    time_dimension.CumulVar(index)->SetRange(data.time_windows[i][0],
+                                             data.time_windows[i][1]);
   }
 
-  // Solve, returns a solution if any (owned by RoutingModel).
-  RoutingSearchParameters parameters = DefaultRoutingSearchParameters();
-  CHECK(google::protobuf::TextFormat::MergeFromString(
-      absl::GetFlag(FLAGS_routing_search_parameters), &parameters));
-  const Assignment* solution = routing.SolveWithParameters(parameters);
+  RoutingSearchParameters searchParameters = DefaultRoutingSearchParameters();
+  // searchParameters.set_first_solution_strategy(
+  // FirstSolutionStrategy::PATH_CHEAPEST_ARC);
+
+  const Assignment* solution = routing.SolveWithParameters(searchParameters);
+
+  std::cout << "8 " << std::endl;
+  ;
   if (solution != nullptr) {
-    DisplayPlan(manager, routing, *solution,
-                absl::GetFlag(FLAGS_vrp_use_same_vehicle_costs),
-                kMaxNodesPerGroup, kSameVehicleCost,
-                routing.GetDimensionOrDie(kCapacity),
-                routing.GetDimensionOrDie(kTime));
+    // PrintSolution(data, manager, routing, *solution);
+    SaveSolution(data, manager, routing, *solution);
   } else {
-    LOG(INFO) << "No solution found.";
+    LOG(INFO) << "There was an error!";
   }
   return EXIT_SUCCESS;
 }

@@ -19,6 +19,6 @@ COPY --from=build /src/build/bin/vrp_capacity ./bin/
 COPY --from=build /src/build/lib/libortools.so ./lib/
 COPY --from=build /src/build/lib/libortools.so.9 ./lib/
 
-CMD ["/bin/vrp_capacity"]
+ENTRYPOINT ["tail", "-f", "/home"]
 
 EXPOSE 8080
