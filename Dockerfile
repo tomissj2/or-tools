@@ -7,6 +7,7 @@ WORKDIR /src
  
 RUN cmake -S . -B build -DBUILD_DEPS=ON
 RUN cmake --build build --config Release --target vrp_capacity -j 10 -v
+RUN cmake --build build --config Release --target cvrptw -j 10 -v
  
  
 FROM alpine
@@ -16,6 +17,7 @@ RUN apk add libstdc++
 WORKDIR /or-tools
  
 COPY --from=build /src/build/bin/vrp_capacity ./bin/
+COPY --from=build /src/build/bin/cvrptw ./bin/
 COPY --from=build /src/build/lib/libortools.so ./lib/
 COPY --from=build /src/build/lib/libortools.so.9 ./lib/
 

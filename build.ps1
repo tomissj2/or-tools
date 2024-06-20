@@ -12,6 +12,7 @@ docker build -t $imageName .
 docker run -d -p $portMapping --name $containerName $imageName
 
 docker cp cppRouringBuildContainer:/or-tools/bin/vrp_capacity ./build_result/bin/
+docker cp cppRouringBuildContainer:/or-tools/bin/cvrptw ./build_result/bin/
 docker cp cppRouringBuildContainer:/or-tools/lib/libortools.so ./build_result/lib/
 docker cp cppRouringBuildContainer:/or-tools/lib/libortools.so.9 ./build_result/lib/
 
